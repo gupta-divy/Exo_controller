@@ -1,7 +1,7 @@
 import time
 from scipy.interpolate import pchip_interpolate
 import numpy as np
-# from flexsea import fxUtils as fxu # pylint: disable=no-name-in-module
+from flexsea import fxUtils as fxu # pylint: disable=no-name-in-module
 from flexsea import fxEnums as fxe # pylint: disable=no-name-in-module
 from flexsea import flexsea as flex
 import csv
