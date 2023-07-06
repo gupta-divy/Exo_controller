@@ -7,6 +7,8 @@ from flexsea import flexsea as flex
 import csv
 from dataclasses import dataclass
 import threading
+import os
+import traceback
 
 #initiate flexSEA object
 fxs = flex.FlexSEA()
@@ -41,6 +43,7 @@ class DataContainer:
     ankle_velocity: float = 0
     ankle_torque: float = 0
     temperature: int = 0
+    gait_state: int = 0
 
 def connect_actpack():
     global dev_id
@@ -77,6 +80,8 @@ def get_user_input():
             continue
 
 def reel_in(cut_off_torque):
+    global data_packet
+    data_packet.gait_state = 1
     Kp_val = 30
     Ki_val = 300
     Kd_val = 0
@@ -89,7 +94,7 @@ def reel_in(cut_off_torque):
     while(True):
         now = time.perf_counter()
         read_data(dev_id, data_packet)
-        write_data(data_packet)
+        write_data(data_packet, data_writer)
         print("Motor_current: ",data_packet.motor_current,'Torque_now: ', data_packet.ankle_torque)
         
         if data_packet.motor_current>3000:
@@ -98,7 +103,7 @@ def reel_in(cut_off_torque):
 
         if data_packet.ankle_torque > cut_off_torque:
             command_voltage(dev_id, 0)
-            print('Torque_now: ', data_packet.ankle_torque)
+            print('Torque_now: ', data_packet. ankle_torque)
             break
 
         if now-reel_in_time > 10:
@@ -113,6 +118,8 @@ def reel_in(cut_off_torque):
     print("Reeled In")
 
 def reel_out(reel_out_angle):
+    global data_packet
+    data_packet.gait_state = 3
     Kp_val = 30
     Ki_val = 300
     Kd_val = 0
@@ -120,12 +127,13 @@ def reel_out(reel_out_angle):
     reel_out_mV = -1*1200
     update_gains(Kp=Kp_val,Kd=Kd_val,Ki=Ki_val,ff=ff_val)
     command_voltage(dev_id,reel_out_mV)
+
     reel_out_time = time.perf_counter()
     initiated_angle = data_packet.ankle_angle
     while(True):
         now = time.perf_counter()
         read_data(dev_id, data_packet)
-        write_data(data_packet)
+        write_data(data_packet, data_writer)
         if now-reel_out_time > 2:
             print('Reeled out: ', data_packet.ankle_angle-initiated_angle)
             break
@@ -134,7 +142,9 @@ def reel_out(reel_out_angle):
     update_gains()
     print("Reeled Out")
 
-def four_pt_spline(rise_fraction = 0.2, peak_fraction = 0.55, peak_hold_time = 0.02, fall_fraction = 0.65, bias_torque = 5, peak_torque=10, spline_time = 1.2):
+def four_pt_spline(rise_fraction = 0.2, peak_fraction = 0.55, peak_hold_time = 0.02, fall_fraction = 0.65, bias_torque = 5, peak_torque=10, dorsi_torque=2, spline_time = 0.75):
+    global data_packet
+    data_packet.gait_state = 2
     Kp_val = 40
     Ki_val = 400
     Kd_val = 0
@@ -142,19 +152,33 @@ def four_pt_spline(rise_fraction = 0.2, peak_fraction = 0.55, peak_hold_time = 0
     update_freq = 200
     update_gains(Kp=Kp_val,Ki=Ki_val,Kd=Kd_val,ff=ff_val)
     spline_x = [0,rise_fraction,peak_fraction,peak_fraction+peak_hold_time,fall_fraction,1]
-    spline_y = [bias_torque,bias_torque,peak_torque,peak_torque,bias_torque,bias_torque]
-    phase = np.linspace(0,1,update_freq*spline_time)
+    spline_y = [bias_torque,bias_torque,peak_torque,peak_torque,dorsi_torque,dorsi_torque]
+    phase = np.linspace(0,1,int(update_freq*spline_time))
     delay = 1/update_freq
     torque_spline = pchip_interpolate(spline_x,spline_y,phase)
     
     for desired_torque in torque_spline:
         read_data(dev_id,data_packet)
-        write_data(data_packet)
+        write_data(data_packet,data_writer)
         command_torque(dev_id,desired_torque=desired_torque)
         time.sleep(delay)
-
     update_gains()
     print("Stance phase complete")
+
+
+def temp_controller():
+    time.sleep(3)
+    reel_in(cut_off_torque=10)
+    four_pt_spline(peak_torque=int(peak_torque))
+    reel_out(reel_out_angle=60)
+
+def time_based_controller(gait_time=0.75, bias_torque=5, peak_torque=10, dorsi_torque=2):
+    reel_in(cut_off_torque=bias_torque, reel_in_voltage=1200)
+    four_pt_spline(rise_fraction = 0.2, peak_fraction = 0.55, peak_hold_time = 0.02, fall_fraction = 0.65, bias_torque = bias_torque, peak_torque=peak_torque, dorsi_torque=dorsi_torque, spline_time = gait_time)
+
+def bandwidth_test(freq=6, torque_range=[2,5]):
+    update_freq = 200
+    pass
 
 def read_data(dev_id, data_packet):
     data = fxs.read_device(dev_id)
@@ -171,15 +195,18 @@ def read_data(dev_id, data_packet):
     data_packet.ankle_velocity = 0
     data_packet.ankle_torque =  data_packet.motor_torque*transmission_ratio*transmission_efficiency
 
-def write_data(data_packet):
-    subfolder_name = 'exo_datalog/'
+def setup_data_writer(data_packet):
+    base_dir = os.getcwd()
+    subfolder_name = base_dir+ '/' + 'exo_datalog/'
     filename = subfolder_name + \
-        time.strftime("%Y%m%d_%H%M_") + '.csv'
-    my_file = open(filename, 'w', newline='')
+        time.strftime("%Y%m%d_%H%M") + '.csv'
+    my_file = open(filename, 'w')
     writer = csv.DictWriter(my_file, fieldnames=data_packet.__dict__.keys())
     writer.writeheader()
+    return writer, my_file
+
+def write_data(data_packet, writer):
     writer.writerow(data_packet.__dict__)
-    my_file.close()
 
 def update_gains(Kp=0,Kd=0,Ki=0,ff=0):
     global dev_id
@@ -210,39 +237,59 @@ def disconnect_actpack(dev_id):
 
 
 if __name__=='__main__':
-    connect_actpack()
-    peak_torque = input("Peak Torque: ")
-    actpack_data = fxs.read_device(dev_id)
-    input_thread = threading.Thread(target = get_user_input)
-    input_thread.daemon = True
-    input_thread.start()
-    torque_now = actpack_data.mot_cur*motor_current_to_torque*transmission_ratio
-    print('Starting Motor_angle: ', actpack_data.mot_ang)
-    print('Ankle Torque: ', torque_now)
-    start_angle = actpack_data.mot_ang
-    start_time = actpack_data.state_time
-    data_packet = DataContainer()
-    while(True):
-        if mode==0:
-            print("Paused")
-            command_voltage(dev_id,0)
-            update_gains()
-            if KeyboardInterrupt:
+
+    ## Try connecting to the exo and apply controller
+    try:
+        #building connection with the exo
+        connect_actpack()
+        peak_torque = input("Peak Torque: ")
+        actpack_data = fxs.read_device(dev_id)
+        
+        # Parallel thread for taking inputs while controller is running
+        input_thread = threading.Thread(target = get_user_input)
+        input_thread.daemon = True
+        input_thread.start()
+        
+        ## Data-record initiator
+        data_packet = DataContainer()
+        data_writer,data_file = setup_data_writer(data_packet)
+        start_angle = actpack_data.mot_ang
+        start_time = actpack_data.state_time
+
+        ## reel-in extra thread at the start of the code
+        reel_in(cut_off_torque=2)
+        
+        ## start the main control loop
+        while(True):
+            ## Check if the code is in pause mode
+            if mode==0:
+                print("Paused")
+                command_voltage(dev_id,0)
+                update_gains()
+                if KeyboardInterrupt:
+                    print('Ctr-C detected, Exiting Gracefully')
+                    break
+                continue
+
+            ## if the code is not in pause mode then try applying the controller
+            try:
+                time_based_controller(gait_time=0.75, bias_torque=5, peak_torque=peak_torque, dorsi_torque=2)
+            
+            except KeyboardInterrupt:
                 print('Ctr-C detected, Exiting Gracefully')
                 break
-            continue
 
-        try:
-            # command_voltage(dev_id,1200)
-            time.sleep(3)
-            reel_in(cut_off_torque=10)
-            four_pt_spline(peak_torque=int(peak_torque))
-            reel_out(reel_out_angle=60)
-        
-        except KeyboardInterrupt:
-            print('Ctr-C detected, Exiting Gracefully')
-            break
+        ## Finish the exo sequence of exo by commanding zero gains and closing data log    
+        data_file.close()
+        update_gains()
+        disconnect_actpack(dev_id)
+        print('Done')
+    
 
-    update_gains()
-    disconnect_actpack(dev_id)
-    print('Done')
+    ## if code runs into any error at any point than fallback closing sequence
+    except Exception as e:
+        update_gains()
+        disconnect_actpack(dev_id)
+        print('Error: ')
+        print(e)
+        print(traceback.format_exc())
