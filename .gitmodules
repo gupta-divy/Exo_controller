@@ -1,0 +1,3 @@
+[submodule "actuator"]
+	path = actuator
+	url = https://github.com/gupta-divy/SEA-CamActuator.git
